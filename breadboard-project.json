@@ -1,0 +1,1180 @@
+{
+  "format": "velxio-project",
+  "version": 1,
+  "boards": [
+    {
+      "id": "arduino-uno",
+      "boardKind": "arduino-uno",
+      "x": 99,
+      "y": 117,
+      "activeFileGroupId": "group-arduino-uno",
+      "languageMode": "arduino",
+      "serialBaudRate": 0
+    }
+  ],
+  "fileGroups": {
+    "group-arduino-uno": [
+      {
+        "name": "sketch.ino",
+        "content": "#include <SPI.h>\r\n#include <Wire.h>\r\n#include <EEPROM.h>\r\n#include <LiquidCrystal_I2C.h>\r\n#include <MFRC522.h>\r\n#include <Keypad.h>\r\n#include <Servo.h>\r\n\r\n#config\r\n#define PIN_RFID_RST 9\r\n#define PIN_RFID_SS  10\r\n#define PIN_SERVO    6\r\n#define PIN_BUZZER   7\r\n#define PIN_LED_BLUE 2\r\n#define PIN_LED_RED  3\r\n\r\n#define FW_VERSION \"3.4.0\"\r\n#define MAX_CARDS 8\r\n#define MAX_LOGS 20\r\n#define MAX_PIN_LEN 6\r\n#define MAX_ATTEMPTS 3\r\n#define LOCKOUT_MS 30000UL\r\n#define AUTOLOCK_MS 8000UL\r\n#define INACTIVITY_MS 15000UL\r\n#define SERVO_STEP_MS 12\r\n#define SCAN_HOLD_MS 1200\r\n\r\n#enums\r\nenum Role : byte { ROLE_GUEST = 0, ROLE_ADMIN = 1, ROLE_MASTER = 2 };\r\n\r\nenum EventType : byte {\r\n    EV_LOGIN_OK = 0, EV_LOGIN_FAIL_CARD, EV_LOGIN_FAIL_PIN,\r\n      EV_ALARM, EV_DOOR_OPEN, EV_DOOR_CLOSE,\r\n        EV_CARD_ADDED, EV_CARD_DELETED, EV_PIN_CHANGED, EV_FACTORY_RESET\r\n};\r\n\r\nenum State {\r\n    ST_BOOT, ST_IDLE, ST_AUTH_SCAN, ST_AUTH_PIN, ST_MENU,\r\n      ST_STATUS, ST_SECURITY, ST_SEC_ADD_SCAN, ST_SEC_ADD_PIN, ST_SEC_DELETE, ST_SEC_CHANGE_SCAN, ST_SEC_CHANGE_PIN,\r\n        ST_LOGS, ST_SYSTEM, ST_SETTINGS, ST_ABOUT,\r\n          ST_ALARM, ST_DOOR_OPEN, ST_SCREENSAVER\r\n};\r\n\r\nenum MenuID : byte { M_LOGIN, M_STATUS, M_LOCK, M_SECURITY, M_SYSTEM, M_LOGS, M_SETTINGS, M_ABOUT };\r\nenum SecID : byte { S_ADD, S_DELETE, S_CHANGE, S_FACTORY, S_SEC_BACK };\r\nenum SetID : byte { SET_BRIGHT, SET_SOUND, SET_ANIM, SET_AUTOLOCK, SET_CLOCK, SET_PINLEN, SET_BACK };\r\n\r\n#structs\r\nstruct Settings {\r\n    byte soundOn;\r\n      byte animOn;\r\n        byte pinLength;\r\n          byte brightSim;\r\n            uint16_t autolockS;\r\n              byte hour, minute, second;\r\n                byte day, month;\r\n                  int year;\r\n};\r\n\r\nstruct CardRecord {\r\n    byte uid[4];\r\n      byte role;\r\n        byte pin[MAX_PIN_LEN];\r\n          byte pinLen;\r\n            byte active;\r\n};\r\n\r\nstruct LogEntry {\r\n    byte eventType;\r\n      byte cardIndex;\r\n        uint32_t timestamp;\r\n};\r\n\r\nstruct ToneStep { unsigned int freq; unsigned int durMs; };\r\n\r\n#eeprom_map\r\n#define EE_MAGIC_ADDR 0\r\n#define EE_MAGIC 0xA5\r\n#define EE_SETTINGS_ADDR 1\r\n#define EE_CARDS_ADDR (EE_SETTINGS_ADDR + sizeof(Settings))\r\n#define EE_LOGIDX_ADDR (EE_CARDS_ADDR + (MAX_CARDS * sizeof(CardRecord)))\r\n#define EE_LOGS_ADDR (EE_LOGIDX_ADDR + 2)\r\n#define cardAddr(i) (EE_CARDS_ADDR + (i) * sizeof(CardRecord))\r\n#define logAddr(i) (EE_LOGS_ADDR + (i) * sizeof(LogEntry))\r\n\r\n#globals\r\nconst byte ROWS = 4, COLS = 4;\r\nbyte rowPins[ROWS] = {A0, A1, A2, A3};\r\nbyte colPins[COLS] = {4, 5, 8, 1};\r\nchar keys[ROWS][COLS] = {\r\n    {'1','2','3','A'},\r\n      {'4','5','6','B'},\r\n        {'7','8','9','C'},\r\n          {'*','0','#','D'}\r\n};\r\n\r\nLiquidCrystal_I2C lcd(0x27, 16, 2);\r\nMFRC522 rfid(PIN_RFID_SS, PIN_RFID_RST);\r\nKeypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);\r\nServo lockServo;\r\n\r\nSettings settings;\r\nState state = ST_BOOT;\r\nState prevState = ST_IDLE;\r\n\r\nbyte pendingUid[4];\r\nint pendingIdx = -1;\r\nchar pinBuf[MAX_PIN_LEN + 1];\r\nbyte pinPos = 0;\r\nbyte fails = 0;\r\nunsigned long lockoutUntil = 0;\r\n\r\nbool doorOpen = false;\r\nunsigned long doorOpenedAt = 0;\r\nint servoAngle = 0, servoTarget = 0;\r\nunsigned long lastServoStep = 0;\r\n\r\nunsigned long lastActivity = 0;\r\nunsigned long stateEnteredAt = 0;\r\nunsigned long lastSecondAt = 0;\r\n\r\nint menuIdx = 0, secIdx = 0, setIdx = 0, logView = 0, delIdx = 0;\r\n\r\n#melodies\r\nconst ToneStep M_BOOT[]    PROGMEM = {{523,80},{659,80},{784,120}};\r\nconst ToneStep M_CLICK[]   PROGMEM = {{1200,25}};\r\nconst ToneStep M_SUCCESS[] PROGMEM = {{880,70},{1174,70},{1568,140}};\r\nconst ToneStep M_FAIL[]    PROGMEM = {{220,150},{160,220}};\r\nconst ToneStep M_ALARM[]   PROGMEM = {{900,120},{500,120}};\r\nconst ToneStep M_UNLOCK[]  PROGMEM = {{659,60},{988,120}};\r\nconst ToneStep M_NAV[]     PROGMEM = {{900,20}};\r\n\r\nconst ToneStep* activeMel = nullptr;\r\nbyte melLen = 0, melPos = 0;\r\nunsigned long melEndAt = 0;\r\nbool melLoop = false;\r\n\r\n#prototypes\r\nvoid loadOrInitEEPROM();\r\nvoid loadSettings();\r\nvoid saveSettings();\r\nvoid enterState(State s);\r\nvoid updateLEDs();\r\nvoid updateBuzzer();\r\nvoid playMelody(const ToneStep* m, byte len, bool loop=false);\r\nvoid stopMelody();\r\nvoid updateServo();\r\nvoid openDoor();\r\nvoid closeDoor();\r\nint findCard(byte* uid);\r\nint freeSlot();\r\nbyte countCards();\r\nvoid addLog(EventType ev, byte idx);\r\nvoid tickClock();\r\nbool scanCard();\r\nvoid lcdCenter(byte r, const char* t);\r\nvoid typeLine(byte r, const char* t, unsigned int ms);\r\nvoid barLine(byte r, byte filled, byte total);\r\nvoid bootSequence();\r\nvoid idle(char key);\r\nvoid authScan();\r\nvoid authPin(char key);\r\nvoid menu(char key);\r\nvoid status(char key);\r\nvoid security(char key);\r\nvoid secAddScan(char key);\r\nvoid secAddPin(char key);\r\nvoid secDelete(char key);\r\nvoid secChangeScan(char key);\r\nvoid secChangePin(char key);\r\nvoid logs(char key);\r\nvoid systemScrn(char key);\r\nvoid settings(char key);\r\nvoid about(char key);\r\nvoid alarm();\r\nvoid doorOpenScrn();\r\nvoid screensaver(char key);\r\nconst char* eventName(byte ev);\r\n\r\n#setup\r\nvoid setup() {\r\n    pinMode(PIN_LED_BLUE, OUTPUT);\r\n      pinMode(PIN_LED_RED, OUTPUT);\r\n        pinMode(PIN_BUZZER, OUTPUT);\r\n\r\n          Wire.begin();\r\n            lcd.init();\r\n              lcd.backlight();\r\n\r\n                SPI.begin();\r\n                  rfid.PCD_Init();\r\n\r\n                    lockServo.attach(PIN_SERVO);\r\n                      lockServo.write(0);\r\n                        servoAngle = 0; servoTarget = 0;\r\n\r\n                          loadOrInitEEPROM();\r\n                            loadSettings();\r\n\r\n                              lastSecondAt = millis();\r\n                                enterState(ST_BOOT);\r\n}\r\n\r\n#loopvoid loop() {\r\n    updateLEDs();\r\n      updateBuzzer();\r\n        updateServo();\r\n          tickClock();\r\n\r\n         char key = keypad.getKey();\r\n           if (key) {\r\n                lastActivity = millis();\r\n                    if (settings.soundOn) playMelody(M_CLICK, 1);\r\n                      \r\n \r\n \r\n   if (state != ST_BOOT && state != ST_SCREENSAVER && state != ST_ALARM && state != ST_DOOR_OPEN) {\r\n        if (millis() - lastActivity > INACTIVITY_MS) enterState(ST_SCREENSAVER);\r\n          \r\n \r\n \r\n   switch (state) {\r\n        case ST_BOOT: break;\r\n            case ST_IDLE: idle(key); break;\r\n                case ST_AUTH_SCAN: authScan(); break;\r\n                    case ST_AUTH_PIN: authPin(key); break;\r\n                        case ST_MENU: menu(key); break;\r\n                            case ST_STATUS: status(key); break;\r\n                                case ST_SECURITY: security(key); break;\r\n                                    case ST_SEC_ADD_SCAN: secAddScan(key); break;\r\n                                        case ST_SEC_ADD_PIN: secAddPin(key); break;\r\n                                            case ST_SEC_DELETE: secDelete(key); break;\r\n                                                case ST_SEC_CHANGE_SCAN: secChangeScan(key); break;\r\n                                                    case ST_SEC_CHANGE_PIN: secChangePin(key); break;\r\n                                                        case ST_LOGS: logs(key); break;\r\n                                                            case ST_SYSTEM: systemScrn(key); break;\r\n                                                                case ST_SETTINGS: settings(key); break;\r\n                                                                    case ST_ABOUT: about(key); break;\r\n                                                                        case ST_ALARM: alarm(); break;\r\n                                                                            case ST_DOOR_OPEN: doorOpenScrn(); break;\r\n                                                                                case ST_SCREENSAVER: screensaver(key); break;\r\n                                                                                  \r\n   \r\n   \r\n   #state_machine\r\n   void enterState(State s) {\r\n      prevState = state;\r\n        state = s;\r\n          stateEnteredAt = millis();\r\n            lcd.clear();\r\n\r\n              switch (s) {\r\n                    case ST_BOOT: bootSequence(); break;\r\n                        case ST_AUTH_PIN: pinPos = 0; memset(pinBuf, 0, sizeof(pinBuf)); break;\r\n                            case ST_MENU: menuIdx = 0; break;\r\n                                case ST_LOGS: logView = 0; break;\r\n                                    case ST_SEC_CHANGE_PIN: pinPos = 0; memset(pinBuf, 0, sizeof(pinBuf)); break;\r\n                                        case ST_ALARM:\r\n                                              digitalWrite(PIN_LED_RED, HIGH);\r\n                                                    if (settings.soundOn) playMelody(M_ALARM, 2, true);\r\n                                                          break;\r\n                                                              case ST_DOOR_OPEN:\r\n                                                                    openDoor();\r\n                                                                          if (settings.soundOn) playMelody(M_UNLOCK, 2);\r\n                                                                                break;\r\n                                                                                    default: break;\r\n                                                                                      \r\n   \r\n   \r\n   #eeprom_mapvoid loadOrInitEEPROM() {\r\n      byte m;\r\n        EEPROM.get(EE_MAGIC_ADDR, m);\r\n          if (m == EE_MAGIC) return;\r\n\r\n            Settings s;\r\n              memset(&s, 0, sizeof(s));\r\n                s.soundOn = 1; s.animOn = 1; s.pinLength = 4; s.brightSim = 100;\r\n                  s.autolockS = 8; s.hour = 0; s.minute = 0; s.second = 0;\r\n                    s.day = 1; s.month = 1; s.year = 2025;\r\n                      EEPROM.put(EE_SETTINGS_ADDR, s);\r\n\r\n                        CardRecord empty;\r\n                          memset(&empty, 0, sizeof(empty));\r\n                            for (byte i = 0; i < MAX_CARDS; i++) EEPROM.put(cardAddr(i), empty);\r\n\r\n                              uint16_t li = 0;\r\n                                EEPROM.put(EE_LOGIDX_ADDR, li);\r\n\r\n                                  LogEntry blank;\r\n                                    blank.eventType = 0xFF; blank.cardIndex = 0xFF; blank.timestamp = 0;\r\n                                      for (byte i = 0; i < MAX_LOGS; i++) EEPROM.put(logAddr(i), blank);\r\n\r\n                                        EEPROM.put(EE_MAGIC_ADDR, (byte)EE_MAGIC);\r\n \r\n \r\n void loadSettings() {\r\n    EEPROM.get(EE_SETTINGS_ADDR, settings);\r\n      if (settings.pinLength == 0 || settings.pinLength > MAX_PIN_LEN) settings.pinLength = 4;\r\n        if (settings.autolockS == 0) settings.autolockS = 8;\r\n \r\n \r\n void saveSettings() { EEPROM.put(EE_SETTINGS_ADDR, settings); }\r\n \r\n int findCard(byte* uid) {\r\n    for (byte i = 0; i < MAX_CARDS; i++) {\r\n          CardRecord c;\r\n              EEPROM.get(cardAddr(i), c);\r\n                  if (c.active && memcmp(c.uid, uid, 4) == 0) return i;\r\n                    \r\n \r\n   return -1;  \r\n   \r\n   int freeSlot() {\r\n      for (byte i = 0; i < MAX_CARDS; i++) {\r\n            CardRecord c;\r\n                EEPROM.get(cardAddr(i), c);\r\n                    if (!c.active) return i;\r\n                      \r\n \r\n   return -1;  \r\n   \r\n   byte countCards() {\r\n      byte n = 0;\r\n        for (byte i = 0; i < MAX_CARDS; i++) {\r\n              CardRecord c;\r\n                  EEPROM.get(cardAddr(i), c);\r\n                      if (c.active) n++;\r\n                        \r\n \r\n   return n;  \r\n   \r\n   void addLog(EventType ev, byte idx) {\r\n      uint16_t w;\r\n        EEPROM.get(EE_LOGIDX_ADDR, w);\r\n          LogEntry e;\r\n            e.eventType = ev; e.cardIndex = idx;\r\n              e.timestamp = (uint32_t)(millis() / 1000UL);\r\n                EEPROM.put(logAddr(w % MAX_LOGS), e);\r\n                  w = (w + 1) % MAX_LOGS;\r\n                    EEPROM.put(EE_LOGIDX_ADDR, w);\r\n \r\n \r\n #tickClockvoid tickClock() {\r\n    if (millis() - lastSecondAt < 1000) return;\r\n      lastSecondAt += 1000;\r\n        settings.second++;\r\n          if (settings.second >= 60) { settings.second = 0; settings.minute++; }\r\n            if (settings.minute >= 60) { settings.minute = 0; settings.hour++; }\r\n              if (settings.hour >= 24) { settings.hour = 0; settings.day++; }\r\n                if (settings.day > 31) { settings.day = 1; settings.month++; }\r\n                  if (settings.month > 12) { settings.month = 1; settings.year++; }\r\n \r\n \r\n void printClock(char* buf, byte buflen) {\r\n    snprintf(buf, buflen, \"%02d:%02d:%02d\", settings.hour, settings.minute, settings.second);\r\n \r\n \r\n #PIN_LED_BLUEvoid updateLEDs() {\r\n    unsigned long now = millis();\r\n      if (state == ST_ALARM) { digitalWrite(PIN_LED_BLUE, LOW); }\r\n        else if (state == ST_AUTH_SCAN || state == ST_AUTH_PIN || state == ST_SEC_ADD_SCAN || state == ST_SEC_CHANGE_SCAN) {\r\n              unsigned int p = now % 800;\r\n                  unsigned int d = (p < 400) ? map(p,0,400,20,100) : map(p,400,800,100,20);\r\n                      digitalWrite(PIN_LED_BLUE, (now % 20) < (d * 20UL / 100));\r\n                        \r\n  else {\r\n        unsigned int p = now % 3000;\r\n            unsigned int d = (p < 1500) ? map(p,0,1500,5,100) : map(p,1500,3000,100,5);\r\n                digitalWrite(PIN_LED_BLUE, (now % 20) < (d * 20UL / 100));\r\n                  \r\n \r\n \r\n   if (state == ST_ALARM) digitalWrite(PIN_LED_RED, (now % 300) < 150);\r\n     else if (millis() < lockoutUntil) digitalWrite(PIN_LED_RED, (now % 500) < 250);\r\n       else digitalWrite(PIN_LED_RED, LOW); }\r\n       \r\n       #updateBuzzervoid playMelody(const ToneStep* m, byte len, bool loop) {\r\n          activeMel = m; melLen = len; melPos = 0; melLoop = loop;\r\n            ToneStep s;\r\n              memcpy_P(&s, &m[0], sizeof(ToneStep));\r\n                tone(PIN_BUZZER, s.freq);\r\n                  melEndAt = millis() + s.durMs;\r\n \r\n \r\n void stopMelody() { activeMel = nullptr; noTone(PIN_BUZZER); }\r\n \r\n void updateBuzzer() {\r\n    if (!activeMel) return;\r\n      if (millis() < melEndAt) return;\r\n        melPos++;\r\n          if (melPos >= melLen) {\r\n                if (melLoop) melPos = 0;\r\n                    else { stopMelody(); return; }\r\n                      \r\n \r\n   ToneStep s;\r\n     memcpy_P(&s, &activeMel[melPos], sizeof(ToneStep));\r\n       tone(PIN_BUZZER, s.freq);\r\n         melEndAt = millis() + s.durMs;  \r\n         \r\n         #servoAnglevoid updateServo() {\r\n            if (servoAngle == servoTarget) return;\r\n              if (millis() - lastServoStep < SERVO_STEP_MS) return;\r\n                lastServoStep = millis();\r\n                  servoAngle += (servoTarget > servoAngle) ? 1 : -1;\r\n                    lockServo.write(servoAngle);\r\n \r\n \r\n void openDoor() {\r\n    doorOpen = true;\r\n      doorOpenedAt = millis();\r\n        servoTarget = 90;\r\n          addLog(EV_DOOR_OPEN, pendingIdx < 0 ? 0xFF : (byte)pendingIdx);\r\n \r\n \r\n void closeDoor() {\r\n    doorOpen = false;\r\n      servoTarget = 0;\r\n        addLog(EV_DOOR_CLOSE, pendingIdx < 0 ? 0xFF : (byte)pendingIdx);\r\n \r\n \r\n #rfidbool scanCard() {\r\n    if (!rfid.PICC_IsNewCardPresent()) return false;\r\n      if (!rfid.PICC_ReadCardSerial()) return false;\r\n        memcpy(pendingUid, rfid.uid.uidByte, 4);\r\n          rfid.PICC_HaltA();\r\n            return true;\r\n \r\n \r\n #lcd_helpers\r\n void lcdCenter(byte r, const char* t) {\r\n    int len = strlen(t);\r\n      int pad = (16 - len) / 2; if (pad < 0) pad = 0;\r\n        lcd.setCursor(0, r); lcd.print(F(\"                \"));\r\n          lcd.setCursor(pad, r); lcd.print(t);\r\n \r\n \r\n void typeLine(byte r, const char* t, unsigned int ms) {\r\n    lcd.setCursor(0, r);\r\n      for (int i = 0; t[i]; i++) { lcd.print(t[i]); delay(ms); }\r\n \r\n \r\n void barLine(byte r, byte filled, byte total) {\r\n    lcd.setCursor(0, r);\r\n      for (byte i = 0; i < total; i++) lcd.print((char)(i < filled ? 255 : 176));\r\n \r\n \r\n #bootSequencevoid bootSequence() {\r\n    lcd.clear();\r\n      lcdCenter(0, F(\"NETIC BIOS\"));\r\n        char v[17]; snprintf(v, sizeof(v), \"v%s\", FW_VERSION);\r\n          lcdCen v\r\n;\r\n  delay(700);\r\n  \r\n    lcd.clear();\r\n      typeLine(0, \"Memory Check...\", 25);\r\n        lcd.setCursor(0, 1);\r\n          for (byte i = 0; i < 16; i++) { lcd.print((char)255); delay(45); }\r\n            delay(300);\r\n            \r\n              const char* steps[] = {\"Loading Sec Kernel\",\"Init RFID...\",\"Crypto Engine\",\"Loading Drivers\",\"Connecting...\"};\r\n                for (byte s = 0; s < 5; s++) {\r\n                      lcd.clear();\r\n                          typeLine(0, steps[s], 18);\r\n                              if (settings.animOn) barLine(1, s + 1, 5);\r\n                                  delay(350);\r\n                                    \r\n \r\n \r\n   lcd.clear();\r\n     lcdCenter(0, F(\"ACCESS TERMINAL\"));\r\n       lcdCenter(1, F(\"READY\"));\r\n         delay(900);\r\n           if (settings.soundOn) playMelody(M_BOOT, 3);\r\n             enterState(ST_IDLE);  \r\n             \r\n             #idlevoid idle(char key) {\r\n                static unsigned long last = 0;\r\n                  if (millis() - last > 500) {\r\n                        last = millis();\r\n                            char t[9]; printClock(t, sizeof(t));\r\n                                lcd.setCursor(0, 0);\r\n                                    lcd.print(t);\r\n                                        lcd.print(doorOpen ? F(\" DOOR OPEN \") : F(\"            \"));\r\n                                            lcd.setCursor(0, 1);\r\n                                                lcd.print(F(\"SCAN CARD #MENU\"));\r\n                                                  \r\n \r\n \r\n   if (key == '#') { enterState(ST_MENU); return; }\r\n   \r\n     if (scanCard()) {\r\n          if (millis() < lockoutUntil) { if (settings.soundOn) playMelody(M_FAIL, 2); enterState(ST_ALARM); return; }\r\n              int idx = findCard(pendingUid);\r\n                  if (idx < 0) {\r\n                          fails++;\r\n                                addLog(EV_LOGIN_FAIL_CARD, 0xFF);\r\n                                      if (settings.soundOn) playMelody(M_FAIL, 2);\r\n                                            lcd.clear(); lcdCenter(0, F(\"ACCESS DENIED\"));\r\n                                                  lcdCenter(1, F(\"UNKNOWN CARD\"));\r\n                                                        delay(SCAN_HOLD_MS);\r\n                                                              if (fails >= MAX_ATTEMPTS) { lockoutUntil = millis() + LOCKOUT_MS; enterState(ST_ALARM); }\r\n                                                                    else enterState(ST_IDLE);\r\n                                                                          return;\r\n                                                                              \r\n \r\n     pendingIdx = idx;\r\n         enterState(ST_AUTH_PIN);\r\n               \r\n               \r\n               #ST_AUTH_SCANvoid authScan() {\r\n                  static bool done = false;\r\n                    if (stateEnteredAt == millis()) done = false;\r\n                      lcdCenter(0, F(\"SCANNING...\"));\r\n                        lcdCenter(1, F(\"PLEASE WAIT\"));\r\n                          if (!done) {\r\n                                done = true;\r\n                                    delay(400);\r\n                                        if (millis() < lockoutUntil) { enterState(ST_ALARM); return; }\r\n                                            int idx = findCard(pendingUid);\r\n                                                if (idx < 0) {\r\n                                                        fails++; addLog(EV_LOGIN_FAIL_CARD, 0xFF);\r\n                                                              if (settings.soundOn) playMelody(M_FAIL, 2);\r\n\r\n      lcd.clear(); lcdCenter(0, F(\"ACCESS DENIED\"));\r\n            lcdCenter(1, F(\"UNKNOWN CARD\"));\r\n                  delay(SCAN_HOLD_MS);\r\n                        if (fails >= MAX_ATTEMPTS) { lockoutUntil = millis() + LOCKOUT_MS; enterState(ST_ALARM); }\r\n                              else enterState(ST_IDLE);\r\n                                    return;\r\n                                        \r\n \r\n     pendingIdx = idx;\r\n         enterState(ST_AUTH_PIN);\r\n               \r\n               \r\n               #ST_AUTH_PINvoid authPin(char key) {\r\n                  static unsigned long last = 0;\r\n                    if (millis() - last > 200 || key) {\r\n                          last = millis();\r\n                              lcd.setCursor(0, 0); lcd.print(F(\"ENTER PIN:      \"));\r\n                                  lcd.setCursor(0, 1);\r\n                                      for (byte i = 0; i < pinPos; i++) lcd.print('*');\r\n                                          for (byte i = pinPos; i < 16; i++) lcd.print(' ');\r\n                                            \r\n \r\n   if (!key) return;\r\n     if (key == 'D') { enterState(ST_IDLE); return; }\r\n       if (key == '*') { if (pinPos > 0) pinPos--; return; }\r\n         if (key == '#') {\r\n              CardRecord c; EEPROM.get(cardAddr(pendingIdx), c);\r\n                  bool ok = (pinPos == c.pinLen);\r\n                      for (byte i = 0; ok && i < pinPos; i++) if (pinBuf[i] - '0' != c.pin[i]) ok = false;\r\n                          lcd.clear();\r\n                              if (ok) {\r\n                                      fails = 0;\r\n                                            addLog(EV_LOGIN_OK, pendingIdx);\r\n                                                  if (settings.soundOn) playMelody(M_SUCCESS, 3);\r\n                                                        lcdCenter(0, F(\"ACCESS GRANTED\"));\r\n                                                              enterState(ST_DOOR_OPEN);\r\n                                                                  \r\n  else {\r\n          fails++;\r\n                addLog(EV_LOGIN_FAIL_PIN, pendingIdx);\r\n                      if (settings.soundOn) playMelody(M_FAIL, 2);\r\n                            lcdCenter(0, F(\"ACCESS DENIED\"));\r\n                                  lcdCenter(1, F(\"WRONG PIN\"));\r\n                                        delay(SCAN_HOLD_MS);\r\n                                              if (fails >= MAX_ATTEMPTS) { lockoutUntil = millis() + LOCKOUT_MS; enterState(ST_ALARM); }\r\n                                                    else enterState(ST_IDLE);\r\n                                                        \r\n \r\n     return;\r\n        }\r\n          if (key >= '0' && key <= '9' && pinPos < settings.pinLength && pinPos < MAX_PIN_LEN) pinBuf[pinPos++] = key;  \r\n          \r\n          #menuvoid menu(char key) {\r\n              static int lastIdx = -1;\r\n                const char* items[] = {\"LOGIN\",\"STATUS\",\"LOCK\",\"SECURITY\",\"SYSTEM\",\"LOGS\",\"SETTINGS\",\"ABOUT\"};\r\n                  if (menuIdx != lastIdx) {\r\n                        lastIdx = menuIdx;\r\n                            lcd.setCursor(0, 0);\r\n                                char b[17]; snprintf(b, sizeof(b), \"> %-14s\", items[menuIdx]);\r\n                                    lcd.print(b);\r\n                                        int nx = (menuIdx + 1) % 8;\r\n                                            lcd.setCursor(0, 1);\r\n                                                snprintf(b, sizeof(b), \"  %-14s\", items[nx]);\r\n                                                    lcd.print(b);\r\n                                                      \r\n \r\n   if (!key) return;\r\n     if (key == 'C') menuIdx = (menuIdx + 1) % 8;\r\n       else if (key == 'D') enterState(ST_IDLE);\r\n         else if (key == '#') {\r\n              lastIdx = -1;\r\n                  switch (menuIdx) {\r\n                          case M_LOGIN: enterState(ST_IDLE); break;\r\n                                case M_STATUS: enterState(ST_STATUS); break;\r\n                                      case M_LOCK: if (!doorOpen) { openDoor(); if (settings.soundOn) playMelody(M_UNLOCK,2);} else { closeDoor(); } enterState(ST_IDLE); break;\r\n                                            case M_SECURITY: secIdx = 0; enterState(ST_SECURITY); break;\r\n                                                  case M_SYSTEM: enterState(ST_SYSTEM); break;\r\n                                                        case M_LOGS: enterState(ST_LOGS); break;\r\n                                                              case M_SETTINGS: setIdx = 0; enterState(ST_SETTINGS); break;\r\n                                                                    case M_ABOUT: enterState(ST_ABOUT); break;\r\n                                                                        \r\n \r\n       \r\n       \r\n       #statusvoid status(char key) {\r\n          if (key == 'D') { enterState(ST_MENU); return; }\r\n            static unsigned long last = 0;\r\n              if (millis() - last > 400) {\r\n                    last = millis();\r\n                        char t[9]; printClock(t, sizeof(t));\r\n                            char l0[17], l1[17];\r\n                                snprintf(l0, sizeof(l0), \"%s D:%s\", t, doorOpen ? \"OPN\" : \"SHU\");\r\n                                    snprintf(l1, sizeof(l1), \"ALM:%s F:%d\", (millis() < lockoutUntil) ? \"Y\" : \"N\", fails);\r\n                                        lcd.setCursor(0, 0); lcd.print(l0);\r\n                                            lcd.setCursor(0, 1); lcd.print(l1);\r\n                                              \r\n   \r\n   \r\n   #securityvoid security(char key) {\r\n      static const char* items[] = {\"ADD CARD\",\"DELETE CARD\",\"CHANGE PIN\",\"FACTORY\",\"BACK\"};\r\n        if (millis() - stateEnteredAt < 30) { lcd.setCursor(0,0); lcd.print(F(\"SECURITY MENU   \")); }\r\n          static byte lastSel = 255;\r\n            if (secIdx != lastSel) {\r\n                  lastSel = secIdx;\r\n                      char b[17]; snprintf(b, sizeof(b), \"> %-14s\", items[secIdx]);\r\n                          lcd.setCursor(0, 1); lcd.print(b);\r\n                            \r\n \r\n   if (!key) return;\r\n     if (key == 'C') secIdx = (secIdx + 1) % 5;\r\n       else if (key == 'D') enterState(ST_MENU);\r\n         else if (key == '#') {\r\n              lastSel = 255;\r\n                  switch (secIdx) {\r\n                          case S_ADD: enterState(ST_SEC_ADD_SCAN); break;\r\n                                case S_DELETE: delIdx = 0; enterState(ST_SEC_DELETE); break;\r\n                                      case S_CHANGE: enterState(ST_SEC_CHANGE_SCAN); break;\r\n                                            case S_FACTORY:\r\n                                                    for (byte i = 0; i < MAX_CARDS; i++) { CardRecord e; memset(&e,0,sizeof(e)); EEPROM.put(cardAddr(i), e); }\r\n                                                            addLog(EV_FACTORY_RESET, 0xFF);\r\n                                                                    lcd.clear(); lcdCenter(0, F(\"FACTORY RESET\"));\r\n                                                                            if (settings.soundOn) playMelody(M_SUCCESS, 3);\r\n                                                                                    delay(900); enterState(ST_SECURITY); break;\r\n                                                                                          case S_SEC_BACK: enterState(ST_MENU); break;\r\n                                                                                              \r\n \r\n       \r\n       \r\n       #ST_SEC_ADD_SCANvoid secAddScan(char key) {\r\n          lcdCenter(0, F(\"SCAN NEW CARD\"));\r\n            lcdCenter(1, F(\"D=CANCEL\"));\r\n              if (key == 'D') { enterState(ST_SECURITY); return; }\r\n                if (scanCard()) {\r\n                      if (findCard(pendingUid) >= 0) { lcdCenter(0, F(\"CARD EXIST\"))}S\"\r\n ; delay(1000); enterState(ST_SECURITY); return;  \r\n     int slot = freeSlot();\r\n         if (slot < 0) { lcdCenter(0, F(\"STORAGE FULL\")); delay(1000); enterState(ST_SECURITY); return; }\r\n             pendingIdx = slot;\r\n                 enterState(ST_SEC_ADD_PIN);\r\n                       \r\n                       \r\n                       #ST_SEC_ADD_PINvoid secAddPin(char key) {\r\n                          static unsigned long last = 0;\r\n                            if (millis() - last > 200 || key) {\r\n                                  last = millis();\r\n                                      lcd.setCursor(0, 0); lcd.print(F(\"SET PIN:        \"));\r\n                                          lcd.setCursor(0, 1);\r\n                                              for (byte i = 0; i < pinPos; i++) lcd.print('*');\r\n                                                  for (byte i = pinPos; i < 16; i++) lcd.print(' ');\r\n                                                    \r\n \r\n   if (!key) return;\r\n     if (key == 'D') { enterState(ST_SECURITY); return; }\r\n       if (key == '*') { if (pinPos > 0) pinPos--; return; }\r\n         if (key == '#') {\r\n              if (pinPos == 0) return;\r\n                  CardRecord c; memset(&c, 0, sizeof(c));\r\n                      memcpy(c.uid, pendingUid, 4);\r\n                          c.role = ROLE_GUEST; c.pinLen = pinPos;\r\n                              for (byte i = 0; i < pinPos; i++) c.pin[i] = pinBuf[i] - '0';\r\n                                  c.active = 1;\r\n                                      EEPROM.put(cardAddr(pendingIdx), c);\r\n                                          addLog(EV_CARD_ADDED, pendingIdx);\r\n                                              if (settings.soundOn) playMelody(M_SUCCESS, 3);\r\n                                                  lcd.clear(); lcdCenter(0, F(\"CARD SAVED\"));\r\n                                                      delay(900); enterState(ST_SECURITY);\r\n                                                          return;\r\n                                                            \r\n \r\n   if (key >= '0' && key <= '9' && pinPos < settings.pinLength && pinPos < MAX_PIN_LEN) pinBuf[pinPos++] = key;  \r\n   \r\n   #ST_SEC_DELETEvoid secDelete(char key) {\r\n      static unsigned long last = 0;\r\n        while (delIdx < MAX_CARDS) {\r\n              CardRecord c; EEPROM.get(cardAddr(delIdx), c);\r\n                  if (c.active) break;\r\n                      delIdx++;\r\n                        \r\n \r\n   if (millis() - last > 250) {\r\n        last = millis();\r\n            if (delIdx >= MAX_CARDS) { lcdCenter(0, F(\"NO CARDS\")); lcdCenter(1, F(\"D=BACK\")); }\r\n                else {\r\n                        char b[17]; snprintf(b, sizeof(b), \"SLOT %d  #=DEL  \", delIdx);\r\n                              lcd.setCursor(0, 0); lcd.print(b);\r\n                                    lcd.setCursor(0, 1); lcd.print(F(\"C=NEXT D=BACK  \"));\r\n                                        \r\n \r\n     \r\n       if (!key) return;\r\n         if (key == 'D') { enterState(ST_SECURITY); return; }\r\n           if (delIdx >= MAX_CARDS) return;\r\n             if (key == 'C') delIdx++;\r\n               else if (key == '#') {\r\n                    CardRecord c; memset(&c, 0, sizeof(c));\r\n                        EEPROM.put(cardAddr(delIdx), c);\r\n                            addLog(EV_CARD_DELETED, delIdx);\r\n                                if (settings.soundOn) playMelody(M_SUCCESS, 2);\r\n                                    lcd.clear(); lcdCenter(0, F(\"DELETED\"));\r\n                                        delay(800); last = 0;\r\n                                          \r\n   \r\n   \r\n   #ST_SEC_CHANGE_SCANvoid secChangeScan(char key) {\r\n      lcdCenter(0, F(\"SCAN CARD\"));\r\n        lcdCenter(1, F(\"D=CANCEL\"));\r\n          if (key == 'D') { enterState(ST_SECURITY); return; }\r\n            if (scanCard()) {\r\n                  int idx = findCard(pendingUid);\r\n                      if (idx < 0) { lcdCenter(0, F(\"NOT FOUND\")); delay(1000); enterState(ST_SECURITY); return; }\r\n                          pendingIdx = idx;\r\n                              enterState(ST_SEC_CHANGE_PIN);\r\n                                \r\n   \r\n   \r\n   #ST_SEC_CHANGE_PINvoid secChangePin(char key) {\r\n      static unsigned long last = 0;\r\n        if (millis() - last > 200 || key) {\r\n              last = millis();\r\n                  lcd.setCursor(0, 0); lcd.print(F(\"NEW PIN:        \"));\r\n                      lcd.setCursor(0, 1);\r\n                          for (byte i = 0; i < pinPos; i++) lcd.print('*');\r\n                              for (byte i = pinPos; i < 16; i++) lcd.print(' ');\r\n                                \r\n \r\n   if (!key) return;\r\n     if (key == 'D') { enterState(ST_SECURITY); return; }\r\n       if (key == '*') { if (pinPos > 0) pinPos--; return; }\r\n         if (key == '#') {\r\n              if (pinPos == 0) return;\r\n                  CardRecord c; EEPROM.get(cardAddr(pendingIdx), c);\r\n                      c.pinLen = pinPos;\r\n                          for (byte i = 0; i < pinPos; i++) c.pin[i] = pinBuf[i] - '0';\r\n                              EEPROM.put(cardAddr(pendingIdx), c);\r\n                                  addLog(EV_PIN_CHANGED, pendingIdx);\r\n                                      if (settings.soundOn) playMelody(M_SUCCESS, 3);\r\n                                          lcd.clear(); lcdCenter(0, F(\"PIN CHANGED\"));\r\n                                              delay(900); enterState(ST_SECURITY);\r\n                                                  return;\r\n                                                    \r\n \r\n   if (key >= '0' && key <= '9' && pinPos < settings.pinLength && pinPos < MAX_PIN_LEN) pinBuf[pinPos++] = key;  \r\n   \r\n   #logsvoid logs(char key) {\r\n      if (key == 'D') { enterState(ST_MENU); return; }\r\n        if (key == 'C') logView = (logView + 1) % MAX_LOGS;\r\n          static int lastDrawn = -1;\r\n            if (logView != lastDrawn || millis() - stateEnteredAt < 30) {\r\n                  lastDrawn = logView;\r\n                      uint16_t w; EEPROM.get(EE_LOGIDX_ADDR, w);\r\n                          int slot = (w - 1 - logView + MAX_LOGS * 2) % MAX_LOGS;\r\n                              LogEntry e; EEPROM.get(logAddr(slot), e);\r\n                                  char l0[17], l1[17];\r\n                                      if (e.eventType == 0xFF) {\r\n                                              snprintf(l0, sizeof(l0), \"-- EMPTY --     \");\r\n                                                    snprintf(l1, sizeof(l1), \"C=NEXT D=BACK   \");\r\n                                                        \r\n  else {\r\n          snprintf(l0, sizeof(l0), \"%-16s\", eventName(e.eventType));\r\n                unsigned long t = e.timestamp;\r\n                      snprintf(l1, sizeof(l1), \"t+%02lu:%02lu:%02lu\", t/3600, (t/60)%60, t%60);\r\n                          \r\n \r\n     lcd.setCursor(0, 0); lcd.print(l0);\r\n         lcd.setCursor(0, 1); lcd.print(l1);\r\n            }  \r\n            \r\n            const char* eventName(byte ev) {\r\n                switch (ev) {\r\n                      case EV_LOGIN_OK: return \"LOGIN OK\";\r\n                          case EV_LOGIN_FAIL_CARD: return \"BAD CARD\";\r\n                              case EV_LOGIN_FAIL_PIN: return \"BAD PIN\";\r\n                                  case EV_ALARM: return \"ALARM\";\r\n                                      case EV_DOOR_OPEN: return \"DOOR OPEN\";\r\n                                          case EV_DOOR_CLOSE: return \"DOOR SHUT\";\r\n                                              case EV_CARD_ADDED: return \"CARD ADD\";\r\n                                                  case EV_CARD_DELETED: return \"CARD DEL\";\r\n                                                      case EV_PIN_CHANGED: return \"PIN CHG\";\r\n                                                          case EV_FACTORY_RESET: return \"FACTORY\";\r\n                                                              default: return \"---\";\r\n                                                                \r\n   \r\n   \r\n   #systemScrnvoid systemScrn(char key) {\r\n      if (key == 'D') { enterState(ST_MENU); return; }\r\n        static unsigned long last = 0;\r\n          if (millis() - last > 500) {\r\n                last = millis();\r\n                    char t[9]; printClock(t, sizeof(t));\r\n                        char l0[17], l1[17];\r\n                            snprintf(l0, sizeof(l0), \"UP:%lus C:%d/%d\", millis()/1000UL, countCards(), MAX_CARDS);\r\n                                snprintf(l1, sizeof(l1), \"v%s %s\", FW_VERSION, t);\r\n                                    lcd.setCursor(0, 0); lcd.print(l0);\r\n                                        lcd.setCursor(0, 1); lcd.print(l1);\r\n                                          \r\n   \r\n   \r\n   #settingsvoid settings(char key) {\r\n      static const char* labels[] = {\"BRIGHT\",\"SOUND\",\"ANIM\",\"AUTOLOCK\",\"CLOCK\",\"PINLEN\",\"BACK\"};\r\n        if (key == 'D') { enterState(ST_MENU); return; }\r\n          if (key == 'C') setIdx = (setIdx + 1) % 7;\r\n            if (key == '#') {\r\n                  switch (setIdx) {\r\n                          case SET_BRIGHT: settings.brightSim = (settings.brightSim >= 100) ? 25 : settings.brightSim + 25; break;\r\n                                case SET_SOUND: settings.soundOn = !settings.soundOn; break;\r\n                                      case SET_ANIM: settings.animOn = !settings.animOn; break;\r\n                                            case SET_AUTOLOCK: settings.autolockS = (settings.autolockS >= 30) ? 4 : settings.autolockS + 2; break;\r\n                                                  case SET_CLOCK:\r\n                                                          settings.minute += 5; if (settings.minute >= 60) { settings.minute = 0; settings.hour = (settings.hour + 1) % 24; }\r\n                                                                  break;\r\n                                                                        case SET_PINLEN: settings.pinLength = (settings.pinLength >= 6) ? 4 : settings.pinLength + 1; break;\r\n                                                                              case SET_BACK: enterState(ST_MENU); return;\r\n                                                                                  \r\n \r\n     saveSettings();\r\n         if (settings.soundOn) playMelody(M_NAV, 1);\r\n             \r\n               static unsigned long last = 0;\r\n                 if (millis() - last > 200 || key) {\r\n                      last = millis();\r\n                          char l0[17], l1[17];\r\n                              snprintf(l0, sizeof(l0), \"> %-14s\", labels[setIdx]);\r\n                                  switch (setIdx) {\r\n                                          case SET_BRIGHT: snprintf(l1, sizeof(l1), \"  %d%%           \", settings.brightSim); break;\r\n                                                case SET_SOUND: snprintf(l1, sizeof(l1), \"  %-14s\", settings.soundOn ? \"ON\" : \"OFF\"); break;\r\n                                                      case SET_ANIM: snprintf(l1, sizeof(l1), \"  %-14s\", settings.animOn ? \"ON\" : \"OFF\"); break;\r\n                                                            case SET_AUTOLOCK: snprintf(l1, sizeof(l1), \"  %ds            \", settings.autolockS); break;\r\n                                                                  case SET_CLOCK: { char t[9]; printClock(t,sizeof(t)); snprintf(l1, sizeof(l1), \"  %-14s\", t); } break;\r\n                                                                        case SET_PINLEN: snprintf(l1, sizeof(l1), \"  %d digits      \", settings.pinLength); break;\r\n                                                                              case SET_BACK: snprintf(l1, sizeof(l1), \"  %-14s\", \"EXIT\"); break;\r\n                                                                                  \r\n \r\n     lcd.setCursor(0, 0); lcd.print(l0);\r\n         lcd.setCursor(0, 1); lcd.print(l1);\r\n               \r\n               \r\n               #ABOUTvoid about(char key) {\r\n                  if (key == 'D') { enterState(ST_MENU); return; }\r\n                    static byte page = 0;\r\n                      if (key == 'C') page = (page + 1) % 2;\r\n                        static unsigned long last = 0;\r\n                          if (millis() - last > 300 || key) {\r\n                                last = millis();\r\n                                    if (page == 0) { lcdCenter(0, F(\"NETIC CYBER TERMINAL\")); lcdCenter(1, F(\"v3.4.0\")); }\r\n                                        else { lcd.setCursor(0,0); lcd.print(__DATE__); lcd.setCursor(0,1); lcd.print(__TIME__); }\r\n                                          \r\n   \r\n   \r\n   #alarmvoid alarm() {\r\n      static unsigned long last = 0;\r\n        if (millis() - last > 300) {\r\n              last = millis();\r\n                  lcdCenter(0, F(\"!! LOCKED OUT !!\"));\r\n                      unsigned long rem = (lockoutUntil > millis()) ? (lockoutUntil - millis()) / 1000UL : 0;\r\n                          char b[17]; snprintf(b, sizeof(b), \"WAIT %lus       \", rem);\r\n                              lcdCenter(1, b);\r\n                                \r\n \r\n   if (millis() >= lockoutUntil) { fails = 0; stopMelody(); enterState(ST_IDLE); }  \r\n   \r\n   #doorOpenvoid doorOpenScrn() {\r\n      static unsigned long last = 0;\r\n        if (millis() - last > 300) {\r\n              last = millis();\r\n                  lcdCenter(0, F(\"ACCESS GRANTED\"));\r\n                      unsigned long rem = (doorOpenedAt + (unsigned long)settings.autolockS * 1000UL > millis())\r\n                                                ? (doorOpenedAt + (unsigned long)settings.autolockS * 1000UL - millis()) / 1000UL : 0;\r\n                                                    char b[17]; snprintf(b, sizeof(b), \"LOCK IN %lus     \", rem);\r\n                                                        lcdCenter(1, b);\r\n                                                          \r\n \r\n   if (millis() - doorOpenedAt > (unsigned long)settings.autolockS * 1000UL) { closeDoor(); enterState(ST_IDLE); }  \r\n   \r\n   #screensavervoid screensaver(char key) {\r\n      if (key) { lastActivity = millis(); enterState(ST_IDLE); return; }\r\n        static unsigned long last = 0;\r\n          if (millis() - last > 400) {\r\n                last = millis();\r\n                    lcd.clear();\r\n                        int pos = (millis() / 400) % 16;\r\n                            lcd.setCursor(pos, 0); lcd.print('*');\r\n                                lcdCenter(1, F(\"NETIC STANDBY\"));\r\n                                  \r\n \r\n   if (scanCard()) enterState(ST_AUTH_SCAN);  \r\n          }\r\n   }     }\r\n   }     }\r\n   }                       }\r\n               }                             }\r\n                 }               }\r\n            }\r\n   }       }\r\n   }             }\r\n            }                                   }\r\n            }\r\n   }      }       }\r\n   }         }\r\n   }            }             }\r\n   }       }\r\n   }      }                           }\r\n                       }          }\r\n       }             }\r\n         }           }\r\n   }           }\r\n       }             }\r\n         }                 }\r\n          }                           }\r\n         }                   }\r\n               }                                           }\r\n                          }\r\n               }             }\r\n     }                 }\r\n             }             } }}}}}}}        }       }\r\n }      }       }\r\n }}}  }     }\r\n   }   }\r\n   } }\r\n }}  }           }\r\n   }}  }          }   \r\n}"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "breadboard_full_1783844566722_x7x1snr6v",
+      "metadataId": "breadboard-full",
+      "x": 548.6343792904905,
+      "y": 27.242514527938454,
+      "properties": {}
+    },
+    {
+      "id": "lcd1602_i2c_1783844834951_ydd50vjhq",
+      "metadataId": "lcd1602-i2c",
+      "x": 447.61140763020654,
+      "y": -34.84416463529245,
+      "properties": {
+        "i2cAddress": "0x27",
+        "contrast": 50,
+        "rotation": 270
+      }
+    },
+    {
+      "id": "lcd1602_1783844848729_wozt2jyqu",
+      "metadataId": "lcd1602",
+      "x": 703.9728978445846,
+      "y": -151.16894028753097,
+      "properties": {
+        "color": "white",
+        "background": "blue",
+        "characters": {
+          "0": 0,
+          "1": 0,
+          "2": 0,
+          "3": 0,
+          "4": 0,
+          "5": 0,
+          "6": 0,
+          "7": 0,
+          "8": 0,
+          "9": 0,
+          "10": 0,
+          "11": 0,
+          "12": 0,
+          "13": 0,
+          "14": 0,
+          "15": 0,
+          "16": 0,
+          "17": 0,
+          "18": 0,
+          "19": 0,
+          "20": 0,
+          "21": 0,
+          "22": 0,
+          "23": 0,
+          "24": 0,
+          "25": 0,
+          "26": 0,
+          "27": 0,
+          "28": 0,
+          "29": 0,
+          "30": 0,
+          "31": 0
+        },
+        "cursor": false,
+        "blink": false,
+        "cursorX": 0,
+        "cursorY": 0,
+        "backlight": true,
+        "pins": "full",
+        "screenOnly": false
+      }
+    },
+    {
+      "id": "rc522_rfid_1783845179775_5etvz2xxd",
+      "metadataId": "rc522-rfid",
+      "x": 633.2993955466404,
+      "y": 431.19971830357304,
+      "properties": {
+        "cardPresent": true,
+        "uid": "DE AD BE EF",
+        "version": "0x92"
+      }
+    },
+    {
+      "id": "servo_1783845871178_crlpqj7vi",
+      "metadataId": "servo",
+      "x": 941.3221206665039,
+      "y": 270.6828308105469,
+      "properties": {
+        "angle": 0,
+        "horn": "single",
+        "hornColor": "#ccc"
+      }
+    },
+    {
+      "id": "buzzer_active_1783845934121_zw613nxmw",
+      "metadataId": "buzzer-active",
+      "x": 873.7699042878412,
+      "y": 361.99462645292107,
+      "properties": {
+        "active": false
+      }
+    },
+    {
+      "id": "resistor_220_1783846028355_r31q16zd2",
+      "metadataId": "resistor-220",
+      "x": 449.3332523182892,
+      "y": 194.39116216129682,
+      "properties": {
+        "value": "220"
+      }
+    },
+    {
+      "id": "led_blue_1783846144153_2dtp38025",
+      "metadataId": "led-blue",
+      "x": 587.0343792904905,
+      "y": 130.24251452793845,
+      "properties": {
+        "color": "blue"
+      },
+      "attachedTo": {
+        "breadboardId": "breadboard_full_1783844566722_x7x1snr6v",
+        "pinMap": {
+          "A": "H5",
+          "C": "H4"
+        }
+      }
+    },
+    {
+      "id": "resistor_220_1783846192478_jnoweuxjl",
+      "metadataId": "resistor-220",
+      "x": 458.6898187238935,
+      "y": 169.6083517071597,
+      "properties": {
+        "value": "220"
+      }
+    },
+    {
+      "id": "led_red_1783846212814_sdcuicw4c",
+      "metadataId": "led-red",
+      "x": 615.8343792904906,
+      "y": 130.24251452793845,
+      "properties": {
+        "color": "red"
+      },
+      "attachedTo": {
+        "breadboardId": "breadboard_full_1783844566722_x7x1snr6v",
+        "pinMap": {
+          "A": "H8",
+          "C": "H7"
+        }
+      }
+    },
+    {
+      "id": "membrane_keypad_1783847689538_a7l5iizzr",
+      "metadataId": "membrane-keypad",
+      "x": 1270.6919938309402,
+      "y": -120.10227321746237,
+      "properties": {
+        "columns": "4",
+        "connector": false,
+        "keys": [
+          "1",
+          "2",
+          "3",
+          "A",
+          "4",
+          "5",
+          "6",
+          "B",
+          "7",
+          "8",
+          "9",
+          "C",
+          "*",
+          "0",
+          "#",
+          "D"
+        ]
+      }
+    }
+  ],
+  "wires": [
+    {
+      "waypoints": [],
+      "id": "wire-1783844762193",
+      "start": {
+        "componentId": "arduino-uno",
+        "pinName": "5V",
+        "x": 259,
+        "y": 308.5
+      },
+      "end": {
+        "componentId": "breadboard_full_1783844566722_x7x1snr6v",
+        "pinName": "BP1",
+        "x": 579.6343792904905,
+        "y": 221.24251452793845
+      },
+      "color": "#cc0000"
+    },
+    {
+      "waypoints": [
+        {
+          "x": 214.5,
+          "y": 96.02918693376256
+        },
+        {
+          "x": 589.2343792904906,
+          "y": 96.02918693376256
+        }
+      ],
+      "id": "wire-1783844779339",
+      "start": {
+        "componentId": "arduino-uno",
+        "pinName": "GND.1",
+        "x": 214.5,
+        "y": 126
+      },
+      "end": {
+        "componentId": "breadboard_full_1783844566722_x7x1snr6v",
+        "pinName": "TN2",
+        "x": 589.2343792904906,
+        "y": 63.242514527938454
+      },
+      "color": "#000000"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783844790364",
+      "start": {
+        "componentId": "breadboard_full_1783844566722_x7x1snr6v",
+        "pinName": "BN2",
+        "x": 589.2343792904906,
+        "y": 234.24251452793845
+      },
+      "end": {
+        "componentId": "arduino-uno",
+        "pinName": "GND.2",
+        "x": 268.5,
+        "y": 308.5
+      },
+      "color": "#000000"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783844858881",
+      "start": {
+        "componentId": "lcd1602_1783844848729_wozt2jyqu",
+        "pinName": "VSS",
+        "x": 741.9728978445846,
+        "y": -14.198940287530974
+      },
+      "end": {
+        "componentId": "lcd1602_i2c_1783844834951_ydd50vjhq",
+        "pinName": "VSS",
+        "x": 533.6114076302065,
+        "y": 85.55583536470746
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783844862481",
+      "start": {
+        "componentId": "lcd1602_1783844848729_wozt2jyqu",
+        "pinName": "VDD",
+        "x": 751.4728978445846,
+        "y": -14.198940287530974
+      },
+      "end": {
+        "componentId": "lcd1602_i2c_1783844834951_ydd50vjhq",
+        "pinName": "VDD",
+        "x": 533.6114076302065,
+        "y": 78.05583536470746
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783844866366",
+      "start": {
+        "componentId": "lcd1602_1783844848729_wozt2jyqu",
+        "pinName": "V0",
+        "x": 761.4728978445846,
+        "y": -14.198940287530974
+      },
+      "end": {
+        "componentId": "lcd1602_i2c_1783844834951_ydd50vjhq",
+        "pinName": "V0",
+        "x": 533.6114076302065,
+        "y": 70.55583536470746
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783844869508",
+      "start": {
+        "componentId": "lcd1602_1783844848729_wozt2jyqu",
+        "pinName": "RS",
+        "x": 770.4728978445846,
+        "y": -14.198940287530974
+      },
+      "end": {
+        "componentId": "lcd1602_i2c_1783844834951_ydd50vjhq",
+        "pinName": "RS",
+        "x": 533.6114076302065,
+        "y": 63.05583536470747
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783844873680",
+      "start": {
+        "componentId": "lcd1602_1783844848729_wozt2jyqu",
+        "pinName": "RW",
+        "x": 780.4728978445846,
+        "y": -14.198940287530974
+      },
+      "end": {
+        "componentId": "lcd1602_i2c_1783844834951_ydd50vjhq",
+        "pinName": "RW",
+        "x": 533.6114076302065,
+        "y": 55.55583536470746
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783844881452",
+      "start": {
+        "componentId": "lcd1602_1783844848729_wozt2jyqu",
+        "pinName": "E",
+        "x": 789.9728978445846,
+        "y": -14.198940287530974
+      },
+      "end": {
+        "componentId": "lcd1602_i2c_1783844834951_ydd50vjhq",
+        "pinName": "E",
+        "x": 533.6114076302065,
+        "y": 48.05583536470746
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783844885357",
+      "start": {
+        "componentId": "lcd1602_1783844848729_wozt2jyqu",
+        "pinName": "D0",
+        "x": 799.4728978445846,
+        "y": -14.198940287530974
+      },
+      "end": {
+        "componentId": "lcd1602_i2c_1783844834951_ydd50vjhq",
+        "pinName": "D0",
+        "x": 533.6114076302065,
+        "y": 40.55583536470746
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783844889204",
+      "start": {
+        "componentId": "lcd1602_1783844848729_wozt2jyqu",
+        "pinName": "D1",
+        "x": 809.4728978445846,
+        "y": -14.198940287530974
+      },
+      "end": {
+        "componentId": "lcd1602_i2c_1783844834951_ydd50vjhq",
+        "pinName": "D1",
+        "x": 533.6114076302065,
+        "y": 33.05583536470753
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783844892998",
+      "start": {
+        "componentId": "lcd1602_1783844848729_wozt2jyqu",
+        "pinName": "D2",
+        "x": 818.9728978445846,
+        "y": -14.198940287530974
+      },
+      "end": {
+        "componentId": "lcd1602_i2c_1783844834951_ydd50vjhq",
+        "pinName": "D2",
+        "x": 533.6114076302065,
+        "y": 25.555835364707523
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783844897962",
+      "start": {
+        "componentId": "lcd1602_1783844848729_wozt2jyqu",
+        "pinName": "D3",
+        "x": 828.4728978445846,
+        "y": -14.198940287530974
+      },
+      "end": {
+        "componentId": "lcd1602_i2c_1783844834951_ydd50vjhq",
+        "pinName": "D3",
+        "x": 533.6114076302065,
+        "y": 18.055835364707523
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783844902152",
+      "start": {
+        "componentId": "lcd1602_1783844848729_wozt2jyqu",
+        "pinName": "D4",
+        "x": 837.9728978445846,
+        "y": -14.198940287530974
+      },
+      "end": {
+        "componentId": "lcd1602_i2c_1783844834951_ydd50vjhq",
+        "pinName": "D4",
+        "x": 533.6114076302065,
+        "y": 10.555835364707523
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783844905677",
+      "start": {
+        "componentId": "lcd1602_1783844848729_wozt2jyqu",
+        "pinName": "D5",
+        "x": 847.4728978445846,
+        "y": -14.198940287530974
+      },
+      "end": {
+        "componentId": "lcd1602_i2c_1783844834951_ydd50vjhq",
+        "pinName": "D5",
+        "x": 533.6114076302065,
+        "y": 3.055835364707523
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783844909386",
+      "start": {
+        "componentId": "lcd1602_1783844848729_wozt2jyqu",
+        "pinName": "D6",
+        "x": 856.9728978445846,
+        "y": -14.198940287530974
+      },
+      "end": {
+        "componentId": "lcd1602_i2c_1783844834951_ydd50vjhq",
+        "pinName": "D6",
+        "x": 533.6114076302065,
+        "y": -4.4441646352924735
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783844912998",
+      "start": {
+        "componentId": "lcd1602_1783844848729_wozt2jyqu",
+        "pinName": "D7",
+        "x": 866.4728978445846,
+        "y": -14.198940287530974
+      },
+      "end": {
+        "componentId": "lcd1602_i2c_1783844834951_ydd50vjhq",
+        "pinName": "D7",
+        "x": 533.6114076302065,
+        "y": -11.944164635292474
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783844917247",
+      "start": {
+        "componentId": "lcd1602_1783844848729_wozt2jyqu",
+        "pinName": "A",
+        "x": 876.4728978445846,
+        "y": -14.198940287530974
+      },
+      "end": {
+        "componentId": "lcd1602_i2c_1783844834951_ydd50vjhq",
+        "pinName": "A",
+        "x": 533.6114076302065,
+        "y": -19.444164635292474
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783844920321",
+      "start": {
+        "componentId": "lcd1602_1783844848729_wozt2jyqu",
+        "pinName": "K",
+        "x": 885.9728978445846,
+        "y": -14.198940287530974
+      },
+      "end": {
+        "componentId": "lcd1602_i2c_1783844834951_ydd50vjhq",
+        "pinName": "K",
+        "x": 533.6114076302065,
+        "y": -26.944164635292474
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [
+        {
+          "x": 375.84195745106774,
+          "y": 73.1521303232962
+        }
+      ],
+      "id": "wire-1783845079824",
+      "start": {
+        "componentId": "arduino-uno",
+        "pinName": "3.3V",
+        "x": 249,
+        "y": 308.5
+      },
+      "end": {
+        "componentId": "breadboard_full_1783844566722_x7x1snr6v",
+        "pinName": "TP1",
+        "x": 579.6343792904905,
+        "y": 50.242514527938454
+      },
+      "color": "#cc0000"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783845093832",
+      "start": {
+        "componentId": "lcd1602_i2c_1783844834951_ydd50vjhq",
+        "pinName": "VCC",
+        "x": 463.6114076302065,
+        "y": 75.1558353647075
+      },
+      "end": {
+        "componentId": "breadboard_full_1783844566722_x7x1snr6v",
+        "pinName": "BP2",
+        "x": 589.2343792904906,
+        "y": 221.24251452793845
+      },
+      "color": "#cc0000"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783845118221",
+      "start": {
+        "componentId": "lcd1602_i2c_1783844834951_ydd50vjhq",
+        "pinName": "GND",
+        "x": 463.6114076302065,
+        "y": 82.1558353647075
+      },
+      "end": {
+        "componentId": "breadboard_full_1783844566722_x7x1snr6v",
+        "pinName": "TN3",
+        "x": 598.8343792904906,
+        "y": 63.242514527938454
+      },
+      "color": "#000000"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783845138724",
+      "start": {
+        "componentId": "lcd1602_i2c_1783844834951_ydd50vjhq",
+        "pinName": "SDA",
+        "x": 463.6114076302065,
+        "y": 68.1558353647075
+      },
+      "end": {
+        "componentId": "arduino-uno",
+        "pinName": "4",
+        "x": 316.5,
+        "y": 126
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783845143922",
+      "start": {
+        "componentId": "lcd1602_i2c_1783844834951_ydd50vjhq",
+        "pinName": "SCL",
+        "x": 463.6114076302065,
+        "y": 61.1558353647075
+      },
+      "end": {
+        "componentId": "arduino-uno",
+        "pinName": "5",
+        "x": 307,
+        "y": 126
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [
+        {
+          "x": 644.6993955466404,
+          "y": 370.11605575525374
+        },
+        {
+          "x": 637.8,
+          "y": 370.11605575525374
+        }
+      ],
+      "id": "wire-1783845197713",
+      "start": {
+        "componentId": "rc522_rfid_1783845179775_5etvz2xxd",
+        "pinName": "GND",
+        "x": 665.0993955466404,
+        "y": 440.79971830357306
+      },
+      "end": {
+        "componentId": "breadboard_full_1783844566722_x7x1snr6v",
+        "pinName": "BP24",
+        "x": 800.4343792904905,
+        "y": 221.24251452793845
+      },
+      "color": "#000000"
+    },
+    {
+      "waypoints": [
+        {
+          "x": 630.2993955466404,
+          "y": 356.80415093723957
+        },
+        {
+          "x": 666.0343792904905,
+          "y": 356.80415093723957
+        }
+      ],
+      "id": "wire-1783845216171",
+      "start": {
+        "componentId": "rc522_rfid_1783845179775_5etvz2xxd",
+        "pinName": "3V3",
+        "x": 650.6993955466404,
+        "y": 440.79971830357306
+      },
+      "end": {
+        "componentId": "breadboard_full_1783844566722_x7x1snr6v",
+        "pinName": "TP10",
+        "x": 666.0343792904905,
+        "y": 50.242514527938454
+      },
+      "color": "#cc0000"
+    },
+    {
+      "waypoints": [
+        {
+          "x": 637.4993955466405,
+          "y": 362.80415093723957
+        },
+        {
+          "x": 865.6322502425061,
+          "y": 362.80415093723957
+        },
+        {
+          "x": 865.6322502425061,
+          "y": 268.1235263054979
+        },
+        {
+          "x": 262,
+          "y": 268.1235263054979
+        }
+      ],
+      "id": "wire-1783845290915",
+      "start": {
+        "componentId": "rc522_rfid_1783845179775_5etvz2xxd",
+        "pinName": "RST",
+        "x": 657.8993955466404,
+        "y": 440.79971830357306
+      },
+      "end": {
+        "componentId": "arduino-uno",
+        "pinName": "9",
+        "x": 262,
+        "y": 126
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [
+        {
+          "x": 701.0993955466404,
+          "y": 409.36501343212683
+        },
+        {
+          "x": 617.616282055651,
+          "y": 409.36501343212683
+        },
+        {
+          "x": 252.5,
+          "y": 440.79971830357306
+        }
+      ],
+      "id": "wire-1783845358756",
+      "start": {
+        "componentId": "rc522_rfid_1783845179775_5etvz2xxd",
+        "pinName": "SDA",
+        "x": 701.0993955466404,
+        "y": 440.79971830357306
+      },
+      "end": {
+        "componentId": "arduino-uno",
+        "pinName": "10",
+        "x": 252.5,
+        "y": 126
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [
+        {
+          "x": 686.6993955466404,
+          "y": 393.0435161980962
+        },
+        {
+          "x": 388.1957506934112,
+          "y": 393.0435161980962
+        },
+        {
+          "x": 388.1957506934112,
+          "y": -38.32954785218414
+        },
+        {
+          "x": 243,
+          "y": -38.32954785218414
+        }
+      ],
+      "id": "wire-1783845412149",
+      "start": {
+        "componentId": "rc522_rfid_1783845179775_5etvz2xxd",
+        "pinName": "MOSI",
+        "x": 686.6993955466404,
+        "y": 440.79971830357306
+      },
+      "end": {
+        "componentId": "arduino-uno",
+        "pinName": "11",
+        "x": 243,
+        "y": 126
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [
+        {
+          "x": 679.4993955466405,
+          "y": 375.56591775027067
+        },
+        {
+          "x": 233.5,
+          "y": 375.56591775027067
+        }
+      ],
+      "id": "wire-1783845451451",
+      "start": {
+        "componentId": "rc522_rfid_1783845179775_5etvz2xxd",
+        "pinName": "MISO",
+        "x": 679.4993955466405,
+        "y": 440.79971830357306
+      },
+      "end": {
+        "componentId": "arduino-uno",
+        "pinName": "12",
+        "x": 233.5,
+        "y": 126
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [
+        {
+          "x": 693.8993955466404,
+          "y": 350.6108399346423
+        },
+        {
+          "x": 224,
+          "y": 350.6108399346423
+        }
+      ],
+      "id": "wire-1783845524400",
+      "start": {
+        "componentId": "rc522_rfid_1783845179775_5etvz2xxd",
+        "pinName": "SCK",
+        "x": 693.8993955466404,
+        "y": 440.79971830357306
+      },
+      "end": {
+        "componentId": "arduino-uno",
+        "pinName": "13",
+        "x": 224,
+        "y": 126
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783845893435",
+      "start": {
+        "componentId": "servo_1783845871178_crlpqj7vi",
+        "pinName": "GND",
+        "x": 947.3221206665039,
+        "y": 326.6828308105469
+      },
+      "end": {
+        "componentId": "breadboard_full_1783844566722_x7x1snr6v",
+        "pinName": "BN5",
+        "x": 618.0343792904905,
+        "y": 234.24251452793845
+      },
+      "color": "#000000"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783845903691",
+      "start": {
+        "componentId": "servo_1783845871178_crlpqj7vi",
+        "pinName": "V+",
+        "x": 947.3221206665039,
+        "y": 336.1828308105469
+      },
+      "end": {
+        "componentId": "breadboard_full_1783844566722_x7x1snr6v",
+        "pinName": "BP3",
+        "x": 598.8343792904906,
+        "y": 221.24251452793845
+      },
+      "color": "#cc0000"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783845924163",
+      "start": {
+        "componentId": "servo_1783845871178_crlpqj7vi",
+        "pinName": "PWM",
+        "x": 947.3221206665039,
+        "y": 345.6828308105469
+      },
+      "end": {
+        "componentId": "arduino-uno",
+        "pinName": "6",
+        "x": 297.5,
+        "y": 126
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783845952028",
+      "start": {
+        "componentId": "buzzer_active_1783845934121_zw613nxmw",
+        "pinName": "+",
+        "x": 893.7699042878412,
+        "y": 425.99462645292107
+      },
+      "end": {
+        "componentId": "arduino-uno",
+        "pinName": "7",
+        "x": 288,
+        "y": 126
+      },
+      "color": "#cc0000"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783845971782",
+      "start": {
+        "componentId": "buzzer_active_1783845934121_zw613nxmw",
+        "pinName": "-",
+        "x": 933.7699042878412,
+        "y": 425.99462645292107
+      },
+      "end": {
+        "componentId": "breadboard_full_1783844566722_x7x1snr6v",
+        "pinName": "BN27",
+        "x": 829.2343792904906,
+        "y": 234.24251452793845
+      },
+      "color": "#000000"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783846017022",
+      "start": {
+        "componentId": "arduino-uno",
+        "pinName": "2",
+        "x": 335.5,
+        "y": 126
+      },
+      "end": {
+        "componentId": "breadboard_full_1783844566722_x7x1snr6v",
+        "pinName": "F3",
+        "x": 598.8343792904906,
+        "y": 158.24251452793845
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [
+        {
+          "x": 455.3332523182892,
+          "y": 165.1501486167077
+        },
+        {
+          "x": 598.8343792904906,
+          "y": 165.1501486167077
+        }
+      ],
+      "id": "wire-1783846046341",
+      "start": {
+        "componentId": "resistor_220_1783846028355_r31q16zd2",
+        "pinName": "1",
+        "x": 455.3332523182892,
+        "y": 206.04116216129682
+      },
+      "end": {
+        "componentId": "breadboard_full_1783844566722_x7x1snr6v",
+        "pinName": "G3",
+        "x": 598.8343792904906,
+        "y": 168.24251452793845
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783846079583",
+      "start": {
+        "componentId": "resistor_220_1783846028355_r31q16zd2",
+        "pinName": "2",
+        "x": 514.1332523182892,
+        "y": 206.04116216129682
+      },
+      "end": {
+        "componentId": "breadboard_full_1783844566722_x7x1snr6v",
+        "pinName": "J4",
+        "x": 608.4343792904905,
+        "y": 198.24251452793845
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783846158688",
+      "start": {
+        "componentId": "breadboard_full_1783844566722_x7x1snr6v",
+        "pinName": "I5",
+        "x": 618.0343792904905,
+        "y": 188.24251452793845
+      },
+      "end": {
+        "componentId": "breadboard_full_1783844566722_x7x1snr6v",
+        "pinName": "BN7",
+        "x": 637.2343792904906,
+        "y": 234.24251452793845
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783846202301",
+      "start": {
+        "componentId": "arduino-uno",
+        "pinName": "3",
+        "x": 326,
+        "y": 126
+      },
+      "end": {
+        "componentId": "resistor_220_1783846192478_jnoweuxjl",
+        "pinName": "1",
+        "x": 464.6898187238935,
+        "y": 181.2583517071597
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783846263752",
+      "start": {
+        "componentId": "resistor_220_1783846192478_jnoweuxjl",
+        "pinName": "2",
+        "x": 523.4898187238934,
+        "y": 181.2583517071597
+      },
+      "end": {
+        "componentId": "breadboard_full_1783844566722_x7x1snr6v",
+        "pinName": "I7",
+        "x": 637.2343792904906,
+        "y": 188.24251452793845
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783846287796",
+      "start": {
+        "componentId": "led_red_1783846212814_sdcuicw4c",
+        "pinName": "A",
+        "x": 646.8343792904906,
+        "y": 178.24251452793845
+      },
+      "end": {
+        "componentId": "breadboard_full_1783844566722_x7x1snr6v",
+        "pinName": "BN8",
+        "x": 646.8343792904906,
+        "y": 234.24251452793845
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783847947269",
+      "start": {
+        "componentId": "membrane_keypad_1783847689538_a7l5iizzr",
+        "pinName": "R1",
+        "x": 1376.6919938309402,
+        "y": 223.89772678253763
+      },
+      "end": {
+        "componentId": "arduino-uno",
+        "pinName": "A0",
+        "x": 307,
+        "y": 308.5
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783847990706",
+      "start": {
+        "componentId": "membrane_keypad_1783847689538_a7l5iizzr",
+        "pinName": "R2",
+        "x": 1386.6919938309402,
+        "y": 223.89772678253763
+      },
+      "end": {
+        "componentId": "arduino-uno",
+        "pinName": "A1",
+        "x": 316.5,
+        "y": 308.5
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783847998015",
+      "start": {
+        "componentId": "membrane_keypad_1783847689538_a7l5iizzr",
+        "pinName": "R3",
+        "x": 1396.1919938309402,
+        "y": 223.89772678253763
+      },
+      "end": {
+        "componentId": "arduino-uno",
+        "pinName": "A2",
+        "x": 326,
+        "y": 308.5
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783848326219",
+      "start": {
+        "componentId": "membrane_keypad_1783847689538_a7l5iizzr",
+        "pinName": "R4",
+        "x": 1405.6919938309402,
+        "y": 223.89772678253763
+      },
+      "end": {
+        "componentId": "arduino-uno",
+        "pinName": "A3",
+        "x": 335.5,
+        "y": 308.5
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783848333742",
+      "start": {
+        "componentId": "membrane_keypad_1783847689538_a7l5iizzr",
+        "pinName": "C1",
+        "x": 1415.1919938309402,
+        "y": 223.89772678253763
+      },
+      "end": {
+        "componentId": "arduino-uno",
+        "pinName": "A4",
+        "x": 345,
+        "y": 308.5
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783848352280",
+      "start": {
+        "componentId": "membrane_keypad_1783847689538_a7l5iizzr",
+        "pinName": "C2",
+        "x": 1424.6919938309402,
+        "y": 223.89772678253763
+      },
+      "end": {
+        "componentId": "arduino-uno",
+        "pinName": "A5",
+        "x": 354.5,
+        "y": 308.5
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783848363080",
+      "start": {
+        "componentId": "membrane_keypad_1783847689538_a7l5iizzr",
+        "pinName": "C3",
+        "x": 1434.4419938309402,
+        "y": 223.89772678253763
+      },
+      "end": {
+        "componentId": "arduino-uno",
+        "pinName": "8",
+        "x": 272,
+        "y": 126
+      },
+      "color": "#22c55e"
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1783848402796",
+      "start": {
+        "componentId": "membrane_keypad_1783847689538_a7l5iizzr",
+        "pinName": "C4",
+        "x": 1444.1919938309402,
+        "y": 223.89772678253763
+      },
+      "end": {
+        "componentId": "arduino-uno",
+        "pinName": "1",
+        "x": 345,
+        "y": 126
+      },
+      "color": "#22c55e"
+    }
+  ],
+  "activeBoardId": "arduino-uno",
+  "ignoreStock": false
+}
